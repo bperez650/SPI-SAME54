@@ -1,0 +1,272 @@
+#include "sam.h"
+
+
+#define SS0 PORT_PC06
+
+/* Prototypes */
+void clock_setup(void);
+void port_setup(void);
+void wait(volatile int d);
+void MSPI_setup(void);
+void master_write(void);
+void SSPI_setup(void);
+void slave_write(void);
+void master_read(void);
+void slave_read(void);
+void start_transaction(void);
+
+/* Global variables */
+volatile char master_receive_array[] = "00000000000000000000";
+volatile char slave_receive_array[] = "00000000000000000000";
+volatile char test_string[] = "Hello there\r";
+volatile char *test_string_ptr;
+volatile char slave_message[] = "ok got it\r";
+volatile char *slave_message_ptr;
+
+
+int main(void){
+
+	/* Initializing functions*/
+	SystemInit();
+	clock_setup();
+	port_setup();
+	MSPI_setup();
+	SSPI_setup();
+	
+	/* assign interrupt priority */
+	NVIC->IP[13] |= 0x40;	//set sercom2 DRE priority to lower
+	NVIC->IP[17] |= 0x40;	//set sercom6 DRE priority to lower
+	/* assign pointer */
+	test_string_ptr = test_string;
+	slave_message_ptr = slave_message;
+	
+	start_transaction();
+	while(1){}
+	
+}
+
+/* CLock source is 12MHz divided to 1MHz */
+void clock_setup(void){
+	//12MHz crystal on board selected mapped to PB22/PB23
+	OSCCTRL->XOSCCTRL[1].bit.ENALC = 1;	//enables auto loop ctrl to control amp of osc
+	OSCCTRL->XOSCCTRL[1].bit.IMULT = 4;
+	OSCCTRL->XOSCCTRL[1].bit.IPTAT = 3;
+	OSCCTRL->XOSCCTRL[1].bit.ONDEMAND = 1;
+	OSCCTRL->XOSCCTRL[1].bit.RUNSTDBY = 1;
+	OSCCTRL->XOSCCTRL[1].bit.XTALEN = 1;	//select ext crystal osc mode
+	OSCCTRL->XOSCCTRL[1].bit.ENABLE = 1;
+	
+	GCLK->GENCTRL[0].reg = GCLK_GENCTRL_SRC_XOSC1 | GCLK_GENCTRL_RUNSTDBY | !(GCLK_GENCTRL_DIVSEL) | GCLK_GENCTRL_OE | GCLK_GENCTRL_GENEN | 12<<16;	//divide by 12 1MHz
+	while(GCLK->SYNCBUSY.bit.GENCTRL0){}
+	
+	GCLK->PCHCTRL[7].bit.CHEN = 0;	//disable for safety first
+	GCLK->PCHCTRL[36].reg = GCLK_PCHCTRL_CHEN | GCLK_PCHCTRL_GEN_GCLK0;	//SERCOM6
+	GCLK->PCHCTRL[23].reg = GCLK_PCHCTRL_CHEN | GCLK_PCHCTRL_GEN_GCLK0;	//SERCOM2
+	
+	MCLK->CPUDIV.reg = 1;	//divide by 1
+	MCLK->APBDMASK.reg |= MCLK_APBDMASK_SERCOM6;	//unmask sercom6
+	MCLK->APBBMASK.reg |= MCLK_APBBMASK_SERCOM2;	//unmask sercom2
+	MCLK->APBDMASK.reg |= MCLK_APBDMASK_ADC1;//unmask ADC1
+}
+
+void port_setup(void){
+	Port *por = PORT;
+	PortGroup *porB = &(por->Group[1]);
+	PortGroup *porC = &(por->Group[2]);
+	
+	/* SERCOM6 SPI Master */
+	porC->PMUX[2].bit.PMUXE = 2;	//PC04 pad0 Data out
+	porC->PMUX[2].bit.PMUXO = 2;	//PC05 pad1 SCLK
+	porC->PMUX[3].bit.PMUXO = 2;	//PC07 pad3 Data in
+	porC->PINCFG[4].bit.PMUXEN = 1;
+	porC->PINCFG[5].bit.PMUXEN = 1;
+	porC->PINCFG[7].bit.PMUXEN = 1;
+	porC->DIRSET.reg |= PORT_PC06;	//SS0 for 1st DAC
+	porC->OUTSET.reg |= PORT_PC06;	//initialize SS0 high
+	
+	/* SERCOM2 SPI Slave */
+	porB->PMUX[13].bit.PMUXE = 2;	//PB26 pad0 Data out
+	porB->PMUX[13].bit.PMUXO = 2;	//PB27 pad1 SCLK
+	porB->PMUX[14].bit.PMUXE = 2;	//PB28 pad2 SS
+	porB->PMUX[14].bit.PMUXO = 2;	//PB29 pad3 Data in
+	porB->PINCFG[26].bit.PMUXEN = 1;
+	porB->PINCFG[27].bit.PMUXEN = 1;
+	porB->PINCFG[28].bit.PMUXEN = 1;
+	porB->PINCFG[29].bit.PMUXEN = 1;
+}
+
+void MSPI_setup(void){
+	Sercom *ser = SERCOM6;
+	SercomSpi *spiM = &(ser->SPI);
+	spiM->CTRLA.reg = 0<<1;	//disable first
+	while(spiM->SYNCBUSY.reg){}
+	spiM->CTRLA.bit.DORD = 1;	//LSB first needed for AD5308
+	spiM->CTRLA.bit.DIPO = 3;	//DI=pad3 PC07
+	spiM->CTRLA.bit.DOPO = 0;	//DO=pad0 PC04, SCK=pad1 PC05
+	spiM->CTRLA.bit.FORM = 0;	//SPI frame form
+	spiM->CTRLA.bit.MODE = 3;	//master mode
+	spiM->CTRLB.bit.MSSEN = 0;	//software controlled SS
+	spiM->CTRLB.bit.CHSIZE = 0;	//8 bit char size
+	spiM->CTRLB.bit.RXEN = 0;	//receive disabled
+	while(spiM->SYNCBUSY.reg){}
+	//spi->BAUD.reg = 55470;	//9600bps at 1MHz
+	spiM->BAUD.reg = 51;	//9600bps at 1MHz
+	NVIC->ISER[2] |= 1<<8;	//enable sercom6 RXC int
+	NVIC->ISER[2] |= 1<<6;	//enable sercom6 DRE int
+	spiM->CTRLA.reg |= 1<<1;	//enable
+	while(spiM->SYNCBUSY.reg){}
+	
+}
+
+void SSPI_setup(void){
+	Sercom *ser = SERCOM2;
+	SercomSpi *spiS = &(ser->SPI);
+	spiS->CTRLA.reg = 0<<1;	//disable first
+	while(spiS->SYNCBUSY.reg){}
+	spiS->CTRLA.bit.DORD = 1;	//LSB first needed for AD5308
+	spiS->CTRLA.bit.DIPO = 3;	//DI=pad3 PC07
+	spiS->CTRLA.bit.DOPO = 0;	//DO=pad0 PC04, SCK=pad1 PC05
+	spiS->CTRLA.bit.FORM = 0;	//SPI frame form
+	spiS->CTRLA.bit.MODE = 2;	//slave mode
+	spiS->CTRLB.bit.CHSIZE = 0;	//8 bit char size
+	spiS->CTRLB.bit.RXEN = 1;	//rx enabled
+	while(spiS->SYNCBUSY.reg){}
+	spiS->INTENSET.bit.RXC = 1;	//enable rx complete int
+	NVIC->ISER[1] |= 1<<24;	//enable sercom6 RXC int
+	NVIC->ISER[1] |= 1<<22;	//enable sercom6 DRE int
+	spiS->CTRLA.reg |= 1<<1;	//enable
+	while(spiS->SYNCBUSY.reg){}
+	
+}
+
+void start_transaction(void){
+	Sercom *ser6 = SERCOM6;
+	SercomSpi *spiM = &(ser6->SPI);
+	Sercom *ser2 = SERCOM2;
+	SercomSpi *spiS = &(ser2->SPI);
+	Port *por = PORT;
+	PortGroup *porC = &(por->Group[2]);
+	//spiM->INTENSET.bit.TXC = 1;
+	porC->OUTCLR.reg = SS0; //pull down SS to start transaction
+	spiS->CTRLB.bit.RXEN = 1;	//rx enabled
+	spiM->INTENSET.bit.RXC = 1;
+	spiM->INTENSET.bit.DRE = 1;
+	
+	
+}
+
+/* Handler for SPI master DRE */
+void SERCOM6_0_Handler(void){
+	Sercom *ser = SERCOM6;
+	SercomSpi *spiM = &(ser->SPI);
+	spiM->INTFLAG.bit.DRE = 1;
+	if(spiM->INTFLAG.bit.DRE == 1 && spiM->INTENSET.bit.DRE == 1){
+		master_write();
+	}
+}
+
+/* Handler for SPI master RXC */
+void SERCOM6_2_Handler(void){
+	Sercom *ser = SERCOM6;
+	SercomSpi *spiM = &(ser->SPI);
+	spiM->INTFLAG.bit.RXC = 1;
+	if(spiM->INTFLAG.bit.RXC == 1 && spiM->INTENSET.bit.RXC == 1){
+		master_read();
+	}
+}
+
+/* Handler for SPI slave DRE */
+void SERCOM2_0_Handler(void){
+	Sercom *ser = SERCOM2;
+	SercomSpi *spiS = &(ser->SPI);
+	spiS->INTFLAG.bit.DRE = 1;
+	if(spiS->INTFLAG.bit.DRE == 1 && spiS->INTENSET.bit.DRE == 1){
+		slave_write();
+	}
+}
+
+/* Handler for SPI slave RXC */
+void SERCOM2_2_Handler(void){
+	Sercom *ser = SERCOM2;
+	SercomSpi *spiS = &(ser->SPI);
+	spiS->INTFLAG.bit.RXC = 1;
+	if(spiS->INTFLAG.bit.RXC == 1 && spiS->INTENSET.bit.RXC == 1){
+		slave_read();
+	}
+}
+
+void master_write(void){
+	Sercom *ser = SERCOM6;
+	SercomSpi *spiM = &(ser->SPI);
+	Sercom *ser2 = SERCOM2;
+	SercomSpi *spiS = &(ser2->SPI);
+	
+	spiM->DATA.reg = *test_string_ptr++;
+
+	//while(spiM->INTFLAG.bit.DRE == 0){}	//wait for DATA reg to be empty
+	//while(spiM->INTFLAG.bit.TXC == 0){}	//wait for tx to finish
+}
+
+void master_read(void){
+	Sercom *ser = SERCOM6;
+	SercomSpi *spiM = &(ser->SPI);
+	Port *por = PORT;
+	PortGroup *porC = &(por->Group[2]);
+	volatile static int i = 0;
+	volatile static int j = 0;
+	if(j == 0){
+		j = 1;
+		master_receive_array[i] = spiM->DATA.reg;
+	}
+	else{
+		master_receive_array[i] = spiM->DATA.reg;
+		if(master_receive_array[i] == '\r'){
+			porC->OUTSET.reg = SS0; //pull up SS to end transaction
+		}
+	i++;
+	}	
+}
+
+void slave_write(void){
+	Sercom *ser2 = SERCOM2;
+	SercomSpi *spiS = &(ser2->SPI);
+	Sercom *ser6 = SERCOM6;
+	SercomSpi *spiM = &(ser6->SPI);
+	// 	spiM->DATA.reg = 48;	//master controls transaction send dummy char
+	// 	spiM->DATA.reg = 48;	//master controls transaction send dummy char
+	// 	spiM->DATA.reg = 48;	//master controls transaction send dummy char
+
+	spiS->DATA.reg = *slave_message_ptr;	//load data
+	//wait(1);
+	spiM->DATA.reg = 48;	//master controls transaction send dummy char
+	slave_message_ptr++;
+	
+	//while(spiS->INTFLAG.bit.DRE == 0){}	//wait for DATA reg to be empty
+	//while(spiS->INTFLAG.bit.TXC == 0){}	//wait for tx to finish
+}
+
+void slave_read(void){
+	Sercom *ser2 = SERCOM2;
+	SercomSpi *spiS = &(ser2->SPI);
+	Sercom *ser6 = SERCOM6;
+	SercomSpi *spiM = &(ser6->SPI);
+	
+	static int i = 0;
+	slave_receive_array[i] = spiS->DATA.reg;
+	if(slave_receive_array[i] == '\r'){
+		spiS->CTRLB.bit.RXEN = 0;	//rx disabled
+		spiM->CTRLB.bit.RXEN = 1;	//receive enabled
+		spiM->INTENCLR.bit.DRE = 1;
+		spiM->INTENSET.bit.RXC = 1;
+		spiS->INTENCLR.bit.RXC = 1;
+		spiS->INTENSET.bit.DRE = 1;	//enable DRE int
+		//slave_write();
+	}
+	i++;
+}
+void wait(volatile int d){
+	int count = 0;
+	while (count < d*1000){
+		count++;
+	}
+}
